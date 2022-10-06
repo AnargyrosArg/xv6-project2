@@ -11,9 +11,15 @@ uint ticks;
 
 extern char trampoline[], uservec[], userret[];
 
+extern struct{
+  struct spinlock lock;
+  int ref_counter[PHYSTOP/PGSIZE];
+} ref_counters;
+
+
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
-
+void cowhandler(uint64,uint64);
 extern int devintr();
 
 void
@@ -65,7 +71,11 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } 
+  else if(r_scause() == 15){
+      cowhandler(r_scause(),r_stval());
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
@@ -218,3 +228,72 @@ devintr()
   }
 }
 
+void cowhandler(uint64 error_code ,uint64 va){
+    struct proc *p;
+    if((p=myproc())==0)
+      panic("Page fault on Null process");
+    if(va >= MAXVA){
+      p->killed=1;
+      return;
+    }
+
+    uint64 pa;
+    pte_t *pte;
+    uint flags;
+    //get pte from virtual in stval register
+    if((pte = walk(p->pagetable, va , 0)) == 0)
+      panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    
+  //  printf("TESTING:%d\n",*pte);
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    
+    //printf("va: %d\n",va);
+    //Validating COW and error handling:
+    if(va >= MAXVA || pte == 0 || !(flags & PTE_U) || !(flags & PTE_V)){
+      printf("Illegal or unmapped virtual address, terminating process\n");
+      //kill process
+      p->killed=1;
+      return;
+    }
+    //printf("flags : %d\n",flags);
+    if((flags & PTE_W)){
+      panic("Potential cow already writable");
+    }
+
+
+    //COW validated ,begin handling:
+    acquire(&ref_counters.lock);
+    int refs = ref_counters.ref_counter[pa/PGSIZE];
+   // printf("refs:%d\n",refs);
+    char* mem;
+
+    if(refs > 1){
+      //allocate new page
+      if((mem=kalloc())==0){
+        printf("Memory allocation failed, Process killed\n");
+        p->killed=1;
+        release(&ref_counters.lock);
+        return;
+      }
+        //printf("allocated\n");
+        //copy contents
+        memmove(mem, (char*)pa,PGSIZE);
+        //update pte to point to new page , with new flags
+        *pte = (PA2PTE(mem) | flags | PTE_V | PTE_W | PTE_U) &~PTE_COW;
+       // printf("new pte:%d\n",*pte);
+        //decrement reference counter
+        --refs;
+    }else if(refs==1){
+      //only one process referencing entry, allow writing , no longer CoW.
+      *pte = (PTE_W | *pte) & ~PTE_COW;
+    }else{
+      panic("cowhandler negative references\n");
+    }
+    //update ref counter table
+    ref_counters.ref_counter[pa/PGSIZE] = refs;
+    //release lock
+    release(&ref_counters.lock);
+}

@@ -5,15 +5,23 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
+#include "spinlock.h"
+#include "proc.h"
 /*
  * the kernel's page table.
  */
 pagetable_t kernel_pagetable;
 
+void copyout_cow(uint64);
+
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+
+extern struct{
+  struct spinlock lock;
+  int ref_counter[PHYSTOP/PGSIZE];
+} ref_counters;
 
 // Make a direct-map page table for the kernel.
 pagetable_t
@@ -303,7 +311,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+ // char *mem; no mem allocated
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -312,13 +320,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+
+  //  if((mem = kalloc()) == 0)  //dont alloc , comment out
+  //    goto err;                // comment out
+  //  memmove(mem, (char*)pa, PGSIZE);  // dont copy ,comment out
+
+    //make child page table entry read only
+    flags = (flags & ~PTE_W)|PTE_COW;
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){   //change mem->pa (old page)
+     // kfree(mem);//comment out , nothing to free
       goto err;
     }
+    //make parent page table entry read only and mark CoW
+    *pte = (*pte & ~PTE_W )| PTE_COW;
+    //increment reference counter for pa 
+    acquire(&ref_counters.lock);
+    ref_counters.ref_counter[pa/PGSIZE]++;
+    release(&ref_counters.lock);
+   // printf("PTE:%d is now COW\n",*pte);
+   // printf("pa:%d\n",pa);
   }
   return 0;
 
@@ -347,7 +368,23 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-
+  if(dstva > MAXVA)
+    return -1;
+  struct proc *p;
+  if((p=myproc())==0)
+    panic("Page fault on Null process");
+  //---------- Identify CoW ------------
+  pte_t* pte;
+  if((pte = walk(p->pagetable, dstva, 0)) == 0){
+    printf("copyout: pte should exist");
+    return -1;
+  }
+  uint flags = PTE_FLAGS(*pte);
+    //handle CoW pages
+  if( !(flags & PTE_W) && (flags & PTE_U) && (flags & PTE_V)){
+    copyout_cow(dstva);
+  }
+  //------------------------------------
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
@@ -431,4 +468,77 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+
+void copyout_cow(uint64 va){
+  struct proc *p;
+  if((p=myproc())==0)
+    panic("Page fault on Null process");
+  if(va>=MAXVA){
+    p->killed=1;
+    return;
+  }
+  uint64 pa;
+  pte_t *pte;
+  uint flags;
+  //get pte from virtual in stval register
+  if((pte = walk(p->pagetable, va , 0)) == 0){
+    printf("copyout_cow: pte should exist\n");
+    p->killed=1;
+    return;
+  }
+    //validity check
+  if((*pte & PTE_V) == 0){
+    printf("copyout_cow: page not present\n");
+    p->killed=1;
+    return;
+  }
+    
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+    //error handling
+  if(pte == 0 || !(flags & PTE_U) || !(flags & PTE_V)){
+    panic("invalid pte\n");
+  }
+  if((flags & PTE_W)){
+      panic("Potential cow already writable\n");
+  }
+
+   acquire(&ref_counters.lock);
+
+    int refs = ref_counters.ref_counter[pa/PGSIZE];
+    //printf("refs:%d\n",refs);
+    char* mem;
+    if(refs > 1){
+      //allocate new page
+      if((mem=kalloc())==0){
+        printf("Memory allocation failed, Process killed\n");
+        p->killed=1;
+        ref_counters.ref_counter[pa/PGSIZE] = refs;
+        release(&ref_counters.lock);
+        return;
+      }
+      
+        //printf("allocated\n");
+        //copy contents
+        memmove(mem, (char*)pa,PGSIZE);
+        //update pte to point to new page , with new flags
+        *pte = (PA2PTE(mem) | flags | PTE_V | PTE_W | PTE_U )&~PTE_COW;
+       // printf("new pte:%d\n",*pte);
+        //decrement reference counter
+        --refs;
+
+
+    }else if(refs==1){
+      //only one process referencing entry, allow writing , no longer CoW.
+      *pte = (PTE_W | *pte) & ~PTE_COW;
+    }else{
+      panic("copyout_cow invalid references\n");
+    }
+    //update ref counter table
+    ref_counters.ref_counter[pa/PGSIZE] = refs;
+    //release lock
+   release(&ref_counters.lock);
 }
